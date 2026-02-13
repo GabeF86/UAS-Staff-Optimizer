@@ -1,24 +1,4 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>UAS — Anesthesia Staffing Optimizer</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #0B1426; font-family: 'DM Sans', -apple-system, sans-serif; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script type="text/babel">
-    const { useState, useEffect } = React;
-
-
+import { useState, useEffect } from "react";
 
 const SITE_DEFINITIONS = [
   { id: "mainOR", label: "Main ORs", alwaysActive: false, hasCount: true },
@@ -39,6 +19,8 @@ const C = {
   solo: "#B06AE8", soloGlow: "rgba(176,106,232,0.25)",
   trauma: "#FF5C5C", traumaGlow: "rgba(255,92,92,0.2)",
   neuroAdd: "#FFD93D", neuroAddGlow: "rgba(255,217,61,0.2)",
+  teeBackup: "#CE93D8", teeBackupGlow: "rgba(206,147,216,0.15)",
+  addOnFlex: "#80CBC4", addOnFlexGlow: "rgba(128,203,196,0.15)",
 };
 
 const FR_MAX = 3;
@@ -64,7 +46,7 @@ function useClock() {
 }
 
 // ─── Algorithm ───────────────────────────────────────────────────
-function calcStaffing(cfg, soloPri = false) {
+function calcStaffing(cfg, soloPri = false, avail = { mds: 99, crnas: 99 }) {
   const { mainORCount, addOnRooms = 0, epLab, neuroLab, tees } = cfg;
   const totalORs = mainORCount + addOnRooms;
   const asgn = [];
@@ -140,16 +122,81 @@ function calcStaffing(cfg, soloPri = false) {
   if (epLab && !soloPri) tryAssignCRNA("EP Lab", "EP Lab");
   if (neuroLab && !soloPri) tryAssignCRNA("Neuro Lab", "Neuro Lab");
 
+  // ── Float staffing — auto-decide MD float vs CRNA floats ──
+  // Count what we've already committed
+  const mdsSoFar = asgn.filter(a => a.type === "MD").length;
+  const crnasSoFar = asgn.filter(a => a.type === "CRNA").length;
+
+  // Estimate: with 2 CRNA floats (normal), would we be short on CRNAs but have spare MDs?
+  const crnasWith2Floats = crnasSoFar + 2;
+  const mdSurplus = avail.mds - mdsSoFar;  // extra MDs beyond what's already assigned
+  const crnaDeficit = crnasWith2Floats - avail.crnas; // positive = short on CRNAs
+
+  // Decision: use MD float if we have a spare MD AND are short on CRNAs (or would break even)
+  const useMDFloat = mdSurplus >= 1 && crnaDeficit >= 1;
+
   const floatCRNAs = [];
-  for (let i = 0; i < 2; i++) {
-    const c = push({ id:`crna-${crt++}`, type:"CRNA", role:`Float ${i+1}`, site:"Float", supervisedBy:endoMD.id,
-      notes: i===0 ? "Breaks, TEEs, add-ons." : "Breaks, GI overflow, trauma." });
-    endoMD.supervises.push(c.id);
-    floatCRNAs.push(c);
+  let mdFloat = null;
+
+  if (useMDFloat) {
+    // MD Float — solo provider, can do TEEs, breaks, add-on coverage independently
+    mdFloat = push({ id:`md-${mdt++}`, type:"MD", role:"Float MD", site:"Float", supervises:[], isSolo:true, isFloat:true,
+      notes:"MD float — covers TEEs solo, break relief, add-on cases. Saves 1 CRNA." });
+
+    // How many CRNA floats do we still need?
+    // With MD float handling TEEs/breaks, we need fewer CRNAs
+    const crnasWith1Float = crnasSoFar + 1;
+    const stillShort = crnasWith1Float > avail.crnas;
+
+    if (!stillShort) {
+      // 1 CRNA float for Endo coverage / break relief
+      if (tees) {
+        const endoCRNA = push({ id:`crna-${crt++}`, type:"CRNA", role:"Endo Float", site:"Endoscopy", supervisedBy:endoMD.id,
+          notes:"Covers GI cases and break relief under Endo MD." });
+        endoMD.supervises.push(endoCRNA.id);
+        floatCRNAs.push(endoCRNA);
+        endoMD.notes = "Covers GI solo + supervises Endo float. Float MD handles TEEs.";
+      } else {
+        const c = push({ id:`crna-${crt++}`, type:"CRNA", role:"Float 1", site:"Float", supervisedBy:endoMD.id,
+          notes:"Breaks, GI overflow, add-ons." });
+        endoMD.supervises.push(c.id);
+        floatCRNAs.push(c);
+      }
+    } else {
+      // 0 CRNA floats — MD float handles everything
+      mdFloat.notes = "MD float — covers TEEs solo, Endo backup, break relief, add-ons. No CRNA floats available.";
+      if (tees) {
+        endoMD.notes = "Covers GI solo. Float MD handles TEEs independently.";
+      }
+    }
+  } else {
+    // Standard: 2 CRNA floats
+    if (tees) {
+      // TEEs ON: Float 1 → TEEs, Float 2 → Endoscopy, both under Endo MD
+      const teeCRNA = push({ id:`crna-${crt++}`, type:"CRNA", role:"TEE Float", site:"TEEs", supervisedBy:endoMD.id,
+        notes:"Covers TEEs/Cardioversions under Endo MD." });
+      endoMD.supervises.push(teeCRNA.id);
+      floatCRNAs.push(teeCRNA);
+
+      const endoCRNA = push({ id:`crna-${crt++}`, type:"CRNA", role:"Endo Float", site:"Endoscopy", supervisedBy:endoMD.id,
+        notes:"Covers GI cases, breaks, add-ons under Endo MD." });
+      endoMD.supervises.push(endoCRNA.id);
+      floatCRNAs.push(endoCRNA);
+
+      endoMD.alsoCovers = ["TEEs"];
+      endoMD.notes = "Covers GI solo + supervises TEE and Endo floats.";
+    } else {
+      // TEEs OFF: Both floats are general-purpose under Endo MD
+      for (let i = 0; i < 2; i++) {
+        const c = push({ id:`crna-${crt++}`, type:"CRNA", role:`Float ${i+1}`, site:"Float", supervisedBy:endoMD.id,
+          notes: i===0 ? "Breaks, TEEs, add-ons." : "Breaks, GI overflow, trauma." });
+        endoMD.supervises.push(c.id);
+        floatCRNAs.push(c);
+      }
+    }
   }
 
   // ── Build contingency coverage lines ──
-  // Pick the MD with the FEWEST supervised CRNAs for each contingency
   const pickLeastLoadedMD = (exclude = []) => {
     const candidates = supMDs
       .filter(m => !m.isSolo && !exclude.includes(m.id))
@@ -157,41 +204,81 @@ function calcStaffing(cfg, soloPri = false) {
     return candidates[0] || floor;
   };
 
-  // Trauma: Float 2 CRNA → supervised by least-loaded Main OR MD
-  const traumaFloat = floatCRNAs[1] || floatCRNAs[0];
-  if (traumaFloat) {
-    const traumaMD = pickLeastLoadedMD();
+  // Trauma: Float CRNA → supervised by least-loaded Main OR MD (or MD float covers directly)
+  if (useMDFloat && floatCRNAs.length === 0) {
+    // MD float is the trauma backup themselves
     contingencies.push({
-      fromId: traumaMD.id, toId: traumaFloat.id,
-      type: "trauma", label: "Trauma coverage (20%)",
+      fromId: mdFloat.id, toId: mdFloat.id,
+      type: "trauma", label: "Trauma — Float MD covers directly",
+    });
+  } else {
+    const traumaFloat = floatCRNAs.length > 1 ? floatCRNAs[1] : floatCRNAs[0];
+    if (traumaFloat) {
+      const traumaMD = pickLeastLoadedMD();
+      contingencies.push({
+        fromId: traumaMD.id, toId: traumaFloat.id,
+        type: "trauma", label: "Trauma coverage (20%)",
+      });
+    }
+  }
+
+  // Neuro add-on: if Neuro is NOT already staffed
+  if (!neuroLab) {
+    if (useMDFloat) {
+      // MD float can cover neuro add-on solo
+      contingencies.push({
+        fromId: mdFloat.id, toId: mdFloat.id,
+        type: "neuro", label: "Neuro add-on — Float MD covers solo",
+      });
+    } else {
+      const neuroFloat = tees ? (floatCRNAs[1] || floatCRNAs[0]) : floatCRNAs[0];
+      if (neuroFloat) {
+        const traumaMDId = contingencies.find(c => c.type === "trauma")?.fromId;
+        const neuroMD = pickLeastLoadedMD(traumaMDId ? [traumaMDId] : []);
+        contingencies.push({
+          fromId: neuroMD.id, toId: neuroFloat.id,
+          type: "neuro", label: "Neuro add-on (35-50%)",
+        });
+      }
+    }
+  }
+
+  // TEEs backup: if a float gets pulled, Floor Runner backs up
+  if (tees && !useMDFloat) {
+    contingencies.push({
+      fromId: floor.id, toId: floatCRNAs[0].id,
+      type: "teeBackup", label: "TEE backup — if float pulled",
     });
   }
 
-  // Neuro add-on: if Neuro is NOT already staffed, Float 1 covers under least-loaded MD
-  if (!neuroLab) {
-    const neuroFloat = floatCRNAs[0];
-    if (neuroFloat) {
-      // Avoid same MD as trauma if possible
-      const traumaMDId = contingencies.find(c => c.type === "trauma")?.fromId;
-      const neuroMD = pickLeastLoadedMD(traumaMDId ? [traumaMDId] : []);
+  // Add-on CRNA flex: if add-on rooms don't run, CRNA covers TEEs/breaks
+  if (addOnRooms > 0) {
+    const addOnCRNA = asgn.find(a => a.isAddOn);
+    if (addOnCRNA) {
       contingencies.push({
-        fromId: neuroMD.id, toId: neuroFloat.id,
-        type: "neuro", label: "Neuro add-on (35-50%)",
+        fromId: endoMD.id, toId: addOnCRNA.id,
+        type: "addOnFlex", label: "Add-on → TEEs/Breaks if unused",
       });
     }
   }
 
   const mds = asgn.filter(a => a.type==="MD"), crnas = asgn.filter(a => a.type==="CRNA");
   const notes = [];
+  if (useMDFloat) notes.push(`🩺 MD Float assigned — ${mdSurplus} surplus MD${mdSurplus>1?"s":""}, ${crnaDeficit} CRNA${crnaDeficit>1?"s":""} short. MD covers TEEs/breaks solo, saving ${floatCRNAs.length === 0 ? "2" : "1"} CRNA float${floatCRNAs.length === 0 ? "s" : ""}.`);
   if (soloPri) notes.push("🔷 MD Solo Priority — MDs solo in EP/Neuro instead of CRNAs.");
   if (totalORs >= 10) notes.push("⚠️ High OR volume — 4 MDs on Main OR supervision.");
   if (addOnRooms > 0) notes.push(`📌 ${addOnRooms} add-on room${addOnRooms>1?"s":""} factored into staffing (${mainORCount} scheduled + ${addOnRooms} add-on = ${totalORs} total).`);
+  if (addOnRooms > 0) notes.push("♻️ If add-on rooms don't run, those CRNAs can cover TEEs or breaks.");
   if (epLab && neuroLab && !soloPri) notes.push("EP & Neuro active — CRNAs under Main OR MDs.");
-  if (tees) notes.push("TEEs scheduled — Float CRNAs under Endo MD.");
+  if (tees && !useMDFloat) notes.push("💜 TEEs active — Endo MD supervises both TEE Float and Endo Float.");
+  if (tees && useMDFloat) notes.push("💜 TEEs active — Float MD handles TEEs independently.");
+  if (tees && !useMDFloat) notes.push("🔶 If a float gets pulled (trauma/neuro), Floor Runner backs up TEEs.");
+  if (!tees && !useMDFloat) notes.push("TEEs not scheduled — both floats in general float pool.");
+  if (!tees && useMDFloat) notes.push("TEEs not scheduled — Float MD available for breaks/add-ons.");
   notes.push(`Floor Runner hard-capped at ${FR_MAX} CRNAs.`);
   notes.push("OB MD floats for TEEs/breaks when available.");
-  notes.push("🔴 Trauma (20%): Float CRNA supervised by Main OR MD.");
-  if (!neuroLab) notes.push("🟡 Neuro add-on (35-50%): Float CRNA covers under Main OR MD.");
+  notes.push("🔴 Trauma (20%): " + (useMDFloat && floatCRNAs.length === 0 ? "Float MD covers directly." : "Float CRNA supervised by Main OR MD."));
+  if (!neuroLab) notes.push("🟡 Neuro add-on (35-50%): " + (useMDFloat ? "Float MD covers solo." : "Float CRNA covers under Main OR MD."));
 
   return { mds, crnas, totalMDs:mds.length, totalCRNAs:crnas.length, totalStaff:mds.length+crnas.length, assignments:asgn, notes, contingencies };
 }
@@ -514,6 +601,7 @@ function StaffingDiagram({ result, setResult }) {
     { key: "Main OR", label: "Main OR", color: C.md, icon: "🏥" },
     { key: "OB", label: "OB / L&D", color: "#E88AD0", icon: "👶" },
     { key: "Endoscopy", label: "Endoscopy", color: "#8BC34A", icon: "🔬" },
+    { key: "TEEs", label: "TEEs / Cardio", color: "#CE93D8", icon: "💜" },
     { key: "Float", label: "Float Pool", color: C.accent, icon: "🔄" },
     { key: "EP Lab", label: "EP Lab", color: "#29B6F6", icon: "⚡" },
     { key: "Neuro Lab", label: "Neuro Lab", color: C.neuroAdd, icon: "🧠" },
@@ -524,9 +612,21 @@ function StaffingDiagram({ result, setResult }) {
     const s = md.site || "Other";
     if (!mdsBySite[s]) mdsBySite[s] = [];
     mdsBySite[s].push(md);
+    // If MD covers additional sites (Endo MD covers TEEs), add to those too
+    if (md.alsoCovers) {
+      md.alsoCovers.forEach(extra => {
+        if (!mdsBySite[extra]) mdsBySite[extra] = [];
+        mdsBySite[extra].push(md);
+      });
+    }
   });
 
-  const activeSites = siteConfig.filter(s => mdsBySite[s.key]?.length > 0);
+  const activeSites = siteConfig.filter(s => {
+    // Show site if it has MDs assigned OR if it has CRNAs assigned
+    if (mdsBySite[s.key]?.length > 0) return true;
+    if (crnas.some(c => c.site === s.key)) return true;
+    return false;
+  });
 
   // Pill chip for CRNAs
   const CRNAChip = ({ crna }) => {
@@ -553,12 +653,14 @@ function StaffingDiagram({ result, setResult }) {
     );
   };
 
-  // MD block inside a lane
-  const MDBlock = ({ md }) => {
+  // MD block inside a lane — siteFilter limits which CRNAs show
+  const MDBlock = ({ md, siteFilter }) => {
     const isSolo = md.isSolo && !md.isFloorRunner;
     const borderCol = isSolo ? C.solo : md.isFloorRunner ? C.warning : C.md;
     const canAccept = selectedCRNA && !(md.isFloorRunner && md.supervises.length >= FR_MAX);
-    const myCRNAs = byMD[md.id] || [];
+    const allCRNAs = byMD[md.id] || [];
+    // If siteFilter is set, only show CRNAs assigned to that site
+    const myCRNAs = siteFilter ? allCRNAs.filter(c => c.site === siteFilter) : allCRNAs;
 
     return (
       <div onClick={() => onMDClick(md)} style={{
@@ -635,34 +737,101 @@ function StaffingDiagram({ result, setResult }) {
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         {activeSites.map((site, si) => {
           const siteMDs = mdsBySite[site.key] || [];
+          const siteCRNAs = crnas.filter(c => c.site === site.key);
+          const isFloatPool = site.key === "Float";
+
+          // Track Endo/TEE lanes for connector
+          const isEndoLane = site.key === "Endoscopy";
+          const isTEELane = site.key === "TEEs";
+          const endoMDInLane = siteMDs.find(m => m.role === "Endo MD");
+          const showConnectorAbove = isTEELane && endoMDInLane;
+
           return (
-            <div key={site.key} style={{
-              display: "flex", borderRadius: 10, overflow: "hidden",
-              background: si % 2 === 0 ? "rgba(255,255,255,0.015)" : "transparent",
-            }}>
-              {/* Site Label Column */}
+            <div key={site.key}>
+              {/* Connector line between Endo and TEE lanes */}
+              {showConnectorAbove && (
+                <div style={{
+                  display: "flex", alignItems: "center", marginLeft: 110 + 1 + 12,
+                  padding: "0 0 0 0", height: 24,
+                }}>
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                  }}>
+                    <div style={{
+                      width: 2, height: 24, background: "#8BC34A",
+                      borderRadius: 1, opacity: 0.6,
+                    }} />
+                    <span style={{
+                      color: "#8BC34A", fontSize: 9, fontWeight: 700,
+                      fontFamily: "'DM Sans',sans-serif", opacity: 0.7,
+                      fontStyle: "italic",
+                    }}>↕ Same MD covers both sites</span>
+                  </div>
+                </div>
+              )}
+
               <div style={{
-                width: 110, flexShrink: 0, padding: "12px 10px",
-                borderLeft: `3px solid ${site.color}`,
-                display: "flex", flexDirection: "column", justifyContent: "center",
-                gap: 2,
+                display: "flex", borderRadius: 10, overflow: "hidden",
+                background: si % 2 === 0 ? "rgba(255,255,255,0.015)" : "transparent",
               }}>
-                <span style={{ fontSize: 14 }}>{site.icon}</span>
-                <span style={{
-                  color: site.color, fontSize: 11, fontWeight: 700,
-                  fontFamily: "'DM Sans',sans-serif", lineHeight: 1.2,
-                }}>{site.label}</span>
-                <span style={{ color: C.textMuted, fontSize: 9 }}>
-                  {siteMDs.length} MD{siteMDs.length > 1 ? "s" : ""}
-                </span>
-              </div>
+                {/* Site Label Column */}
+                <div style={{
+                  width: 110, flexShrink: 0, padding: "12px 10px",
+                  borderLeft: `3px solid ${site.color}`,
+                  display: "flex", flexDirection: "column", justifyContent: "center",
+                  gap: 2,
+                }}>
+                  <span style={{ fontSize: 14 }}>{site.icon}</span>
+                  <span style={{
+                    color: site.color, fontSize: 11, fontWeight: 700,
+                    fontFamily: "'DM Sans',sans-serif", lineHeight: 1.2,
+                  }}>{site.label}</span>
+                  {isFloatPool ? (
+                    <span style={{ color: C.textMuted, fontSize: 9 }}>
+                      {siteMDs.length > 0 ? `${siteMDs.length} MD` : ""}{siteMDs.length > 0 && siteCRNAs.length > 0 ? " + " : ""}{siteCRNAs.length > 0 ? `${siteCRNAs.length} CRNA${siteCRNAs.length !== 1 ? "s" : ""}` : ""}
+                    </span>
+                  ) : (
+                    <span style={{ color: C.textMuted, fontSize: 9 }}>
+                      {siteMDs.length} MD{siteMDs.length !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                </div>
 
-              {/* Vertical divider */}
-              <div style={{ width: 1, background: C.border, margin: "8px 0", flexShrink: 0 }} />
+                {/* Vertical divider */}
+                <div style={{ width: 1, background: C.border, margin: "8px 0", flexShrink: 0 }} />
 
-              {/* MD → CRNA rows */}
-              <div style={{ flex: 1, padding: "4px 12px", minWidth: 0 }}>
-                {siteMDs.map(md => <MDBlock key={md.id} md={md} />)}
+                {/* Content area */}
+                <div style={{ flex: 1, padding: "4px 12px", minWidth: 0, display: "flex", alignItems: "center" }}>
+                  {isFloatPool && siteMDs.length === 0 ? (
+                    /* Float Pool with CRNAs only (no MD float) */
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "8px 0" }}>
+                      {siteCRNAs.map(crna => <CRNAChip key={crna.id} crna={crna} />)}
+                      <span style={{
+                        color: C.textMuted, fontSize: 9, fontStyle: "italic",
+                        fontFamily: "'DM Sans',sans-serif",
+                      }}>supervised by Endo MD</span>
+                    </div>
+                  ) : isFloatPool && siteMDs.length > 0 ? (
+                    /* Float Pool with MD Float + optional CRNA floats */
+                    <div style={{ width: "100%" }}>
+                      {siteMDs.map(md => <MDBlock key={md.id + site.key} md={md} siteFilter={site.key} />)}
+                      {siteCRNAs.length > 0 && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "4px 0 8px" }}>
+                          {siteCRNAs.map(crna => <CRNAChip key={crna.id} crna={crna} />)}
+                          <span style={{
+                            color: C.textMuted, fontSize: 9, fontStyle: "italic",
+                            fontFamily: "'DM Sans',sans-serif",
+                          }}>supervised by Endo MD</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    /* Normal lanes: MD → CRNAs */
+                    <div style={{ width: "100%" }}>
+                      {siteMDs.map(md => <MDBlock key={md.id + site.key} md={md} siteFilter={site.key} />)}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           );
@@ -681,20 +850,25 @@ function StaffingDiagram({ result, setResult }) {
               const from = result.assignments.find(a => a.id === cg.fromId);
               const to = result.assignments.find(a => a.id === cg.toId);
               if (!from || !to) return null;
-              const isT = cg.type === "trauma";
-              const col = isT ? C.trauma : C.neuroAdd;
+              const typeMap = {
+                trauma: { col: C.trauma, bg: C.traumaGlow, icon: "🚨" },
+                neuro: { col: C.neuroAdd, bg: C.neuroAddGlow, icon: "🧠" },
+                teeBackup: { col: C.teeBackup, bg: C.teeBackupGlow, icon: "💜" },
+                addOnFlex: { col: C.addOnFlex, bg: C.addOnFlexGlow, icon: "♻️" },
+              };
+              const t = typeMap[cg.type] || typeMap.trauma;
               return (
                 <div key={i} style={{
                   flex: "1 1 240px",
-                  background: isT ? C.traumaGlow : C.neuroAddGlow,
-                  border: `1.5px solid ${col}`, borderRadius: 10, padding: "10px 14px",
+                  background: t.bg,
+                  border: `1.5px solid ${t.col}`, borderRadius: 10, padding: "10px 14px",
                 }}>
                   <div style={{
-                    color: col, fontSize: 11, fontWeight: 700,
+                    color: t.col, fontSize: 11, fontWeight: 700,
                     fontFamily: "'DM Sans',sans-serif", marginBottom: 6,
                     display: "flex", alignItems: "center", gap: 5,
                   }}>
-                    <span style={{ fontSize: 13 }}>{isT ? "🚨" : "🧠"}</span>{cg.label}
+                    <span style={{ fontSize: 13 }}>{t.icon}</span>{cg.label}
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{
@@ -702,12 +876,17 @@ function StaffingDiagram({ result, setResult }) {
                       borderRadius: 5, padding: "2px 7px", fontWeight: 700,
                       fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.text,
                     }}>{from.role}</span>
-                    <span style={{ color: col, fontSize: 14, fontWeight: 800 }}>→</span>
-                    <span style={{
-                      background: C.bg, border: `1.5px solid ${C.crna}`,
-                      borderRadius: 8, padding: "2px 7px", fontWeight: 700,
-                      fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.text,
-                    }}>{to.role}</span>
+                    {cg.fromId !== cg.toId && (<>
+                      <span style={{ color: t.col, fontSize: 14, fontWeight: 800 }}>→</span>
+                      <span style={{
+                        background: C.bg, border: `1.5px solid ${C.crna}`,
+                        borderRadius: 8, padding: "2px 7px", fontWeight: 700,
+                        fontFamily: "'DM Sans',sans-serif", fontSize: 10, color: C.text,
+                      }}>{to.role}</span>
+                    </>)}
+                    {cg.fromId === cg.toId && (
+                      <span style={{ color: t.col, fontSize: 10, fontStyle: "italic" }}>covers independently</span>
+                    )}
                   </div>
                 </div>
               );
@@ -730,7 +909,9 @@ function StaffingDiagram({ result, setResult }) {
           { border: C.crna, label: "CRNA", shape: "dot" },
           { border: C.warning, label: "Add-On CRNA", shape: "dot", dashed: true },
           { border: C.trauma, label: "Trauma (20%)", shape: "line" },
-          { border: C.neuroAdd, label: "Neuro Add-on (35-50%)", shape: "line" },
+          { border: C.neuroAdd, label: "Neuro Add-on", shape: "line" },
+          { border: C.teeBackup, label: "TEE Backup", shape: "line" },
+          { border: C.addOnFlex, label: "Add-on Flex", shape: "line" },
         ].map(i => (
           <div key={i.label} style={{ display: "flex", alignItems: "center", gap: 4 }}>
             {i.shape === "dot" ? (
@@ -839,7 +1020,7 @@ function AssignmentTable({ result }) {
 }
 
 // ─── Main App ────────────────────────────────────────────────────
-function PaoliStaffingApp() {
+export default function PaoliStaffingApp() {
   const [cfg, setCfg] = useState({ mainORCount:8, addOnRooms:0, epLab:false, neuroLab:false, endoscopy:true, tees:false, ob:true });
   const [soloPri, setSoloPri] = useState(false);
   const [avail, setAvail] = useState({ mds:5, crnas:10 });
@@ -847,7 +1028,7 @@ function PaoliStaffingApp() {
   const [tab, setTab] = useState("diagram");
   const clock = useClock();
 
-  useEffect(() => { setResult(calcStaffing(cfg, soloPri)); }, [cfg, soloPri]);
+  useEffect(() => { setResult(calcStaffing(cfg, soloPri, avail)); }, [cfg, soloPri, avail]);
 
   if(!result) return null;
 
@@ -933,9 +1114,3 @@ function PaoliStaffingApp() {
     </div>
   );
 }
-
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(React.createElement(PaoliStaffingApp));
-  </script>
-</body>
-</html>
